@@ -1,6 +1,12 @@
 """
 Google Sheets Manager
 Handles saving leads to Google Sheets
+
+FIXES APPLIED:
+- Batch insert instead of single row appends (avoids rate limiting)
+- Efficient duplicate checking (load sheet once, not per lead)
+- Better retry logic with exponential backoff
+- Proper error handling and logging
 """
 
 import gspread
@@ -11,6 +17,11 @@ from datetime import datetime
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+# Google Sheets API limits
+MAX_RETRIES = 5
+BASE_RETRY_DELAY = 2  # seconds
+BATCH_SIZE = 50  # rows per batch insert
 
 
 class GoogleSheetsManager:
@@ -80,69 +91,202 @@ class GoogleSheetsManager:
             logger.error(f"Error connecting to Google Sheets: {e}")
             raise
 
+    def _retry_with_backoff(self, func, *args, **kwargs):
+        """Execute function with exponential backoff retry logic"""
+        for attempt in range(MAX_RETRIES):
+            try:
+                return func(*args, **kwargs)
+            except gspread.exceptions.APIError as e:
+                if e.response.status_code == 429:  # Rate limited
+                    delay = BASE_RETRY_DELAY * (2 ** attempt)
+                    logger.warning(f"Rate limited. Waiting {delay}s before retry {attempt + 1}/{MAX_RETRIES}")
+                    time.sleep(delay)
+                elif attempt < MAX_RETRIES - 1:
+                    delay = BASE_RETRY_DELAY * (2 ** attempt)
+                    logger.warning(f"API error: {e}. Retrying in {delay}s...")
+                    time.sleep(delay)
+                else:
+                    raise
+            except Exception as e:
+                if attempt < MAX_RETRIES - 1:
+                    delay = BASE_RETRY_DELAY * (2 ** attempt)
+                    logger.warning(f"Error: {e}. Retrying in {delay}s...")
+                    time.sleep(delay)
+                else:
+                    raise
+        return None
+
+    def _load_existing_data(self):
+        """Load existing sheet data once for efficient duplicate checking"""
+        try:
+            all_values = self._retry_with_backoff(self.sheet.get_all_values)
+            if not all_values:
+                return set(), set()
+
+            existing_phones = set()
+            existing_name_address = set()
+
+            for row in all_values[1:]:  # Skip header
+                if len(row) < 5:
+                    continue
+
+                name = (row[1] if len(row) > 1 else "").strip()
+                address = (row[2] if len(row) > 2 else "").strip()
+                phone = (row[4] if len(row) > 4 else "").strip()
+
+                # Normalize phone for comparison
+                if phone and phone != "N/A":
+                    normalized_phone = ''.join(filter(str.isdigit, phone))
+                    if normalized_phone:
+                        existing_phones.add(normalized_phone)
+
+                # Name+address combo
+                if name and address and address != "N/A":
+                    existing_name_address.add(f"{name.lower()}|{address.lower()}")
+
+            return existing_phones, existing_name_address
+        except Exception as e:
+            logger.error(f"Error loading existing data: {e}")
+            return set(), set()
+
+    def add_leads_batch(self, leads, sms_sent=False, sms_date=None, notes=""):
+        """
+        Add multiple leads to Google Sheets efficiently using batch insert.
+        This is MUCH faster and more reliable than adding one at a time.
+
+        Returns: (added_count, skipped_count, failed_count)
+        """
+        if not leads:
+            return 0, 0, 0
+
+        logger.info(f"Loading existing data for duplicate check...")
+        existing_phones, existing_name_address = self._load_existing_data()
+        logger.info(f"Found {len(existing_phones)} existing phones, {len(existing_name_address)} name+address combos")
+
+        # Filter and prepare rows
+        rows_to_add = []
+        skipped = 0
+
+        for lead in leads:
+            name = lead.get("name", "").strip()
+            if not name or name == "N/A":
+                skipped += 1
+                continue
+
+            phone = lead.get("phone", "").strip()
+            address = lead.get("address", "").strip()
+
+            # Check duplicates
+            is_duplicate = False
+
+            # Check phone
+            if phone and phone != "N/A":
+                normalized_phone = ''.join(filter(str.isdigit, phone))
+                if normalized_phone and normalized_phone in existing_phones:
+                    logger.debug(f"Duplicate (phone): {name}")
+                    skipped += 1
+                    is_duplicate = True
+                else:
+                    existing_phones.add(normalized_phone)  # Add to set to catch dupes within batch
+
+            # Check name+address
+            if not is_duplicate and name and address and address != "N/A":
+                combo = f"{name.lower()}|{address.lower()}"
+                if combo in existing_name_address:
+                    logger.debug(f"Duplicate (name+address): {name}")
+                    skipped += 1
+                    is_duplicate = True
+                else:
+                    existing_name_address.add(combo)
+
+            if is_duplicate:
+                continue
+
+            # Prepare row
+            row = [
+                datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                name,
+                address if address else "N/A",
+                lead.get("state", "N/A"),
+                phone if phone else "N/A",
+                lead.get("website", "N/A"),
+                lead.get("category", "N/A"),
+                lead.get("search_location", "N/A"),
+                lead.get("search_category", "N/A"),
+                lead.get("rating", "N/A"),
+                "Yes" if sms_sent else "No",
+                sms_date if sms_date else "",
+                notes,
+            ]
+            rows_to_add.append(row)
+
+        if not rows_to_add:
+            logger.info("No new leads to add (all duplicates or invalid)")
+            return 0, skipped, 0
+
+        # Batch insert with chunking
+        added = 0
+        failed = 0
+
+        for i in range(0, len(rows_to_add), BATCH_SIZE):
+            batch = rows_to_add[i:i + BATCH_SIZE]
+            batch_num = (i // BATCH_SIZE) + 1
+            total_batches = (len(rows_to_add) + BATCH_SIZE - 1) // BATCH_SIZE
+
+            logger.info(f"Inserting batch {batch_num}/{total_batches} ({len(batch)} rows)...")
+
+            try:
+                # Use append_rows for batch insert (much more efficient)
+                self._retry_with_backoff(
+                    self.sheet.append_rows,
+                    batch,
+                    value_input_option='USER_ENTERED'
+                )
+                added += len(batch)
+                logger.info(f"✅ Batch {batch_num} inserted successfully")
+
+                # Small delay between batches to be safe
+                if i + BATCH_SIZE < len(rows_to_add):
+                    time.sleep(1)
+
+            except Exception as e:
+                logger.error(f"❌ Failed to insert batch {batch_num}: {e}")
+                failed += len(batch)
+
+        logger.info(f"Batch insert complete: {added} added, {skipped} skipped, {failed} failed")
+        return added, skipped, failed
+
     def add_lead(self, business_info, sms_sent=False, sms_date=None, notes=""):
         """
-        Add a lead to Google Sheets with improved error handling
+        Add a single lead to Google Sheets.
+        NOTE: For multiple leads, use add_leads_batch() instead - it's much faster!
 
         business_info keys we expect (all optional):
-        - name
-        - address
-        - state
-        - phone
-        - website
-        - category
-        - search_location
-        - search_category
-        - rating
+        - name, address, state, phone, website, category
+        - search_location, search_category, rating
         """
         try:
-            # Validate we have at least a name
             name = business_info.get("name", "").strip()
             if not name or name == "N/A":
                 logger.warning("Skipping lead with no name")
                 return False
-            
-            # Get existing leads (with retry)
-            all_values = []
-            max_retries = 3
-            for attempt in range(max_retries):
-                try:
-                    all_values = self.sheet.get_all_values()
-                    break
-                except Exception as e:
-                    if attempt < max_retries - 1:
-                        logger.warning(f"Error reading sheet (attempt {attempt + 1}), retrying...")
-                        time.sleep(1)
-                    else:
-                        logger.error(f"Failed to read sheet after {max_retries} attempts: {e}")
-                        return False
-            
+
+            # Load existing data for duplicate check
+            existing_phones, existing_name_address = self._load_existing_data()
+
             phone = business_info.get("phone", "").strip()
             address = business_info.get("address", "").strip()
 
-            # Skip if already exists (same phone or same name+address)
-            for row in all_values[1:]:  # Skip header
-                if len(row) < 5:  # Skip incomplete rows
-                    continue
-                    
-                existing_name = (row[1] if len(row) > 1 else "").strip()
-                existing_phone = (row[4] if len(row) > 4 else "").strip()
-                existing_address = (row[2] if len(row) > 2 else "").strip()
-
-                # Check by phone (if both have phones)
-                if phone and phone != "N/A" and existing_phone and existing_phone == phone:
+            # Check duplicates
+            if phone and phone != "N/A":
+                normalized_phone = ''.join(filter(str.isdigit, phone))
+                if normalized_phone in existing_phones:
                     logger.debug(f"Lead already exists (phone): {name}")
                     return False
 
-                # Check by name+address (if both have addresses)
-                if (
-                    name
-                    and existing_name == name
-                    and address
-                    and address != "N/A"
-                    and existing_address
-                    and existing_address == address
-                ):
+            if name and address and address != "N/A":
+                combo = f"{name.lower()}|{address.lower()}"
+                if combo in existing_name_address:
                     logger.debug(f"Lead already exists (name+address): {name}")
                     return False
 
@@ -164,18 +308,9 @@ class GoogleSheetsManager:
             ]
 
             # Append with retry
-            for attempt in range(max_retries):
-                try:
-                    self.sheet.append_row(row)
-                    logger.info(f"✅ Added lead: {name} | {phone if phone != 'N/A' else 'No phone'}")
-                    return True
-                except Exception as e:
-                    if attempt < max_retries - 1:
-                        logger.warning(f"Error appending row (attempt {attempt + 1}), retrying...")
-                        time.sleep(1)
-                    else:
-                        logger.error(f"Failed to add lead after {max_retries} attempts: {e}")
-                        return False
+            self._retry_with_backoff(self.sheet.append_row, row)
+            logger.info(f"✅ Added lead: {name} | {phone if phone != 'N/A' else 'No phone'}")
+            return True
 
         except Exception as e:
             logger.error(f"❌ Error adding lead to sheet: {e}")

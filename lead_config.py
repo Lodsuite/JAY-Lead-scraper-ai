@@ -49,9 +49,9 @@ BUSINESS_CATEGORIES = [
 
 # Limit results per category/location.
 # This is how many leads to collect per category in each location.
-# With 9 locations and 10 categories at 10 each = ~900 potential leads
+# With 5 locations and 7 categories at 10 each = ~350 potential leads
 MAX_RESULTS_PER_CATEGORY = 10  # 10 leads per category
-DELAY_BETWEEN_REQUESTS = 10     # seconds between searches
+DELAY_BETWEEN_REQUESTS = 12     # seconds between searches (increased for stability)
 
 # Two-pass strategy:
 # 1) Fast list scrape

@@ -246,7 +246,7 @@ class LeadScraper:
         return unique_leads
 
     def save_leads_to_sheets(self, leads):
-        """Save leads to Google Sheets"""
+        """Save leads to Google Sheets using efficient batch insert"""
         # Get existing leads count before saving
         try:
             existing_leads = self.sheets_manager.get_all_leads()
@@ -254,37 +254,51 @@ class LeadScraper:
         except Exception as e:
             logger.warning(f"Could not get existing leads count: {e}")
             existing_leads_count = 0
-        
-        logger.info(f"\nSaving {len(leads)} leads to Google Sheets...")
-        saved_count = 0
-        skipped_count = 0
 
-        for lead in leads:
-            try:
-                success = self.sheets_manager.add_lead(lead)
-                if success:
-                    saved_count += 1
-                else:
-                    skipped_count += 1
+        logger.info(f"\n{'=' * 70}")
+        logger.info(f"💾 SAVING LEADS TO GOOGLE SHEETS")
+        logger.info(f"{'=' * 70}")
+        logger.info(f"Leads to process: {len(leads)}")
+        logger.info(f"Using batch insert for reliability...")
 
-                # Small delay to avoid rate limiting (reduced for speed)
-                time.sleep(0.2)
+        try:
+            # Use batch insert - MUCH faster and more reliable
+            added, skipped, failed = self.sheets_manager.add_leads_batch(leads)
 
-            except Exception as e:
-                logger.error(f"Error saving lead {lead.get('name', 'Unknown')}: {e}")
-                skipped_count += 1
+            # Print statistics
+            print(f"\n{'=' * 70}")
+            print(f"📊 GOOGLE SHEETS SAVE RESULTS")
+            print(f"{'=' * 70}")
+            print(f"📋 Existing leads before this run: {existing_leads_count}")
+            print(f"✅ New leads added: {added}")
+            print(f"⏭️  Skipped (duplicates/invalid): {skipped}")
+            if failed > 0:
+                print(f"❌ Failed to save: {failed}")
+            print(f"🎯 Total leads after this run: {existing_leads_count + added}")
+            print(f"{'=' * 70}\n")
 
-        total_new_leads = saved_count
-        logger.info(f"Saved {saved_count} new leads. Skipped {skipped_count} duplicates.")
-        
-        # Print statistics
-        print(f"\n{'=' * 70}")
-        print(f"📊 Existing leads before this run: {existing_leads_count}")
-        print(f"➕ New leads added this run: {total_new_leads}")
-        print(f"🎯 Total leads after this run: {existing_leads_count + total_new_leads}")
-        print(f"{'=' * 70}\n")
-        
-        return saved_count
+            if failed > 0:
+                logger.warning(f"⚠️  {failed} leads failed to save. Check logs for details.")
+
+            return added
+
+        except Exception as e:
+            logger.error(f"❌ Critical error saving leads: {e}")
+            import traceback
+            logger.debug(traceback.format_exc())
+
+            # Fallback to single insert if batch fails
+            logger.info("Attempting fallback to single-row insert...")
+            saved_count = 0
+            for lead in leads:
+                try:
+                    if self.sheets_manager.add_lead(lead):
+                        saved_count += 1
+                    time.sleep(1)  # Longer delay for safety
+                except Exception as inner_e:
+                    logger.error(f"Error saving {lead.get('name', 'Unknown')}: {inner_e}")
+
+            return saved_count
 
     def send_sms_to_leads(self, send_to_all: bool = False):
         """
